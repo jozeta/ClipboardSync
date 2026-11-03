@@ -1,0 +1,4 @@
+# Known fake keys for claude-audit (tools/audit-all.sh): one <commit>:<path> per reviewed finding.
+# README placeholder token (one repeated character), not a real key.
+# Reviewed 2026-11-03. Exact entries only, so any new finding is still reported.
+1096af0:README.md
