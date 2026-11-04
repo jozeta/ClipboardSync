@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer and Pester 5
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
+      - name: Lint (Invoke-ScriptAnalyzer; errors fail, warnings are listed)
+        run: |
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $r | Sort-Object Severity, ScriptName, Line | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+          $errs = @($r | Where-Object Severity -eq 'Error')
+          Write-Host "$($errs.Count) errors, $(@($r).Count - $errs.Count) warnings"
+          if ($errs.Count -gt 0) { exit 1 }
+      - name: Tests (Invoke-Pester)
+        run: |
+          Import-Module Pester -MinimumVersion 5.5
+          Invoke-Pester -Path tests -CI

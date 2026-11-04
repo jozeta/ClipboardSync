@@ -6,6 +6,9 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- First automated tests (Pester: secret scanner, AES-256 round trip, text hash) and CI on Windows
+  that runs PSScriptAnalyzer and the tests
+
 ## 2026-11-02
 
 - Add security policy

@@ -17,7 +17,8 @@ scanner. The README is the full user guide.
 
 Parameters: `-GistId` and `-Token` (PAT with `gist` scope only) are required; `-FileName`
 (default `clipboard.json`, must match on all machines), `-PollMin`/`-PollMax` (15/30 s),
-`-Passphrase`. Windows-only (uses the Windows clipboard); there is no test suite. Test with two
+`-Passphrase`. Windows-only (uses the Windows clipboard). `Invoke-Pester -Path tests` covers the secret scanner and the
+encryption (functions loaded from the syntax tree; the sync loop never runs); test syncing itself with two
 machines or two sessions pointed at a throwaway secret Gist.
 
 ## How it works
@@ -41,3 +42,11 @@ machines or two sessions pointed at a throwaway secret Gist.
 - Gists keep every revision forever. Anything that weakens the secret scanner or makes encryption
   easier to skip is a security regression; update README §5–§9 if behaviour changes.
 - Keep the payload format backward compatible, or all machines must be upgraded together.
+
+## App standards
+
+This repo follows the app standards in `~/Desktop/code/tools/standards/STANDARDS.md` (rule IDs,
+severities; decisions and waivers in `.claude-standards`). `claude-check --repo .` checks it.
+Lint: `Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1`; CI runs it
+and Pester on Windows.
+
