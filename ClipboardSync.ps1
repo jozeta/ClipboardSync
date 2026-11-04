@@ -331,9 +331,6 @@ Write-SyncLog ("Host: {0}  |  Gist: {1}  |  Poll: {2}-{3}s  |  Enc: {4}" -f
 
 $inboundScript = {
     # GistId, Token and FileName are read by the nested Gist functions below (dynamic scope).
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'GistId', Justification = 'Used by nested functions')]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Token', Justification = 'Used by nested functions')]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'FileName', Justification = 'Used by nested functions')]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Passphrase', Justification = 'Comes from an environment variable; see the main param block')]
     param(
         [hashtable]$shared,

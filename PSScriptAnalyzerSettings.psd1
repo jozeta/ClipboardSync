@@ -4,5 +4,7 @@
     Severity     = @('Error', 'Warning')
     # The console log is the user interface of this script.
     # PSUseBOMForUnicodeEncodedFile: the script requires PowerShell 7, which reads UTF-8 without a BOM.
-    ExcludeRules = @('PSAvoidUsingWriteHost', 'PSUseBOMForUnicodeEncodedFile')
+    # PSReviewUnusedParameter: the runspace script block's parameters are read by its nested functions
+    # (dynamic scope), which the rule can't see, and it ignores suppressions on script blocks.
+    ExcludeRules = @('PSAvoidUsingWriteHost', 'PSUseBOMForUnicodeEncodedFile', 'PSReviewUnusedParameter')
 }
