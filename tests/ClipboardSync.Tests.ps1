@@ -4,6 +4,10 @@
 #   Invoke-Pester -Path tests
 # The fake credentials are assembled at run time, so no token-shaped literal sits in this file.
 
+# $Passphrase is set in each test for the functions it calls (they read it from the caller's scope).
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'Passphrase', Justification = 'Read by the functions under test')]
+param()
+
 BeforeAll {
     $path = Join-Path $PSScriptRoot '..' 'ClipboardSync.ps1'
     $tokens = $null; $errors = $null

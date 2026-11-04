@@ -47,6 +47,9 @@
         -PollMin 10 -PollMax 20
 #>
 
+# The passphrase is meant to come from an environment variable (-Passphrase $env:CLIPBOARD_PASSPHRASE);
+# a SecureString parameter would break that.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Passphrase', Justification = 'Passed from an environment variable')]
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $true)]  [string]$GistId,
@@ -64,7 +67,7 @@ $ErrorActionPreference = "Stop"
 #  LOGGING  (main thread)
 # =============================================================================
 
-function Write-Log {
+function Write-SyncLog {
     param([string]$Message, [string]$Level = "INFO", [string]$Tag = "   ")
     $color = switch ($Level) {
         "OK"    { "Green"  }
@@ -285,36 +288,36 @@ $shared = [hashtable]::Synchronized(@{
 # =============================================================================
 
 if ($GistId -notmatch '^[0-9a-f]{20,40}$') {
-    Write-Log "GistId does not look like a valid Gist ID (expected 20-40 hex chars)." "ERROR" "SYS"
+    Write-SyncLog "GistId does not look like a valid Gist ID (expected 20-40 hex chars)." "ERROR" "SYS"
     exit 1
 }
 
 if ($Token -notmatch '^(gh[psohr]_|github_pat_)') {
-    Write-Log "Token does not look like a GitHub PAT (expected ghp_, gho_, ghs_, ghr_, or github_pat_)." "WARN" "SYS"
+    Write-SyncLog "Token does not look like a GitHub PAT (expected ghp_, gho_, ghs_, ghr_, or github_pat_)." "WARN" "SYS"
 }
 
 if ($PollMin -le 0 -or $PollMax -lt $PollMin) {
-    Write-Log "Invalid poll interval: PollMin ($PollMin) must be > 0 and PollMax ($PollMax) must be >= PollMin." "ERROR" "SYS"
+    Write-SyncLog "Invalid poll interval: PollMin ($PollMin) must be > 0 and PollMax ($PollMax) must be >= PollMin." "ERROR" "SYS"
     exit 1
 }
 
 if ($Passphrase) {
-    Write-Log "Encryption: AES-256-CBC, PBKDF2-SHA256 (200 000 iterations)." "INFO" "SYS"
+    Write-SyncLog "Encryption: AES-256-CBC, PBKDF2-SHA256 (200 000 iterations)." "INFO" "SYS"
 }
 
-Write-Log "Verifying Gist access..." "INFO" "SYS"
+Write-SyncLog "Verifying Gist access..." "INFO" "SYS"
 try {
     $probe = Get-Gist
     $shared.LastRemoteStamp = if ($probe) { $probe.UpdatedAt } else { "" }
-    Write-Log "Gist access confirmed. Host: $($env:COMPUTERNAME)" "OK" "SYS"
+    Write-SyncLog "Gist access confirmed. Host: $($env:COMPUTERNAME)" "OK" "SYS"
 }
 catch {
-    Write-Log "Could not reach the Gist. Check GistId and Token. Error: $_" "ERROR" "SYS"
+    Write-SyncLog "Could not reach the Gist. Check GistId and Token. Error: $_" "ERROR" "SYS"
     exit 1
 }
 
-Write-Log "ClipboardSync started. Press Ctrl+C to stop." "OK" "SYS"
-Write-Log ("Host: {0}  |  Gist: {1}  |  Poll: {2}-{3}s  |  Enc: {4}" -f
+Write-SyncLog "ClipboardSync started. Press Ctrl+C to stop." "OK" "SYS"
+Write-SyncLog ("Host: {0}  |  Gist: {1}  |  Poll: {2}-{3}s  |  Enc: {4}" -f
     $env:COMPUTERNAME, $GistId, $PollMin, $PollMax,
     $(if ($Passphrase) { "ON" } else { "OFF" })) "INFO" "SYS"
 
@@ -327,6 +330,9 @@ Write-Log ("Host: {0}  |  Gist: {1}  |  Poll: {2}-{3}s  |  Enc: {4}" -f
 # =============================================================================
 
 $inboundScript = {
+    # GistId, Token and FileName are read by the nested Gist functions below (dynamic scope).
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Used by nested functions')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Passphrase', Justification = 'Comes from an environment variable; see the main param block')]
     param(
         [hashtable]$shared,
         [string]$GistId,
@@ -338,7 +344,7 @@ $inboundScript = {
     )
 
     # ── logging (via queue — Write-Host doesn't reach parent console) ─────────
-    function Write-Log {
+    function Write-SyncLog {
         param([string]$Message, [string]$Level = "INFO")
         $shared.LogQueue.Enqueue([pscustomobject]@{
             Ts      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
@@ -406,7 +412,7 @@ $inboundScript = {
     }
 
     # ── inbound loop ──────────────────────────────────────────────────────────
-    Write-Log "Inbound loop started — polling every $PollMin-$PollMax s." "OK"
+    Write-SyncLog "Inbound loop started — polling every $PollMin-$PollMax s." "OK"
     $rng       = New-Object System.Random
     $firstPoll = $true
 
@@ -414,11 +420,11 @@ $inboundScript = {
         try {
             if ($firstPoll) {
                 $firstPoll = $false
-                Write-Log "Performing initial poll..."
+                Write-SyncLog "Performing initial poll..."
             }
             else {
                 $delay = $rng.Next($PollMin, $PollMax + 1)
-                Write-Log "Next poll in $delay s..."
+                Write-SyncLog "Next poll in $delay s..."
                 Start-Sleep -Seconds $delay
             }
 
@@ -427,7 +433,7 @@ $inboundScript = {
             if ($null -eq $remote -or $remote.Content -eq "{}") { continue }
 
             if ($remote.UpdatedAt -eq $shared.LastRemoteStamp) {
-                Write-Log "No new data from peers."
+                Write-SyncLog "No new data from peers."
                 continue
             }
 
@@ -437,7 +443,7 @@ $inboundScript = {
             # Decrypt inner payload if needed
             if ($outer.encrypted) {
                 if ([string]::IsNullOrEmpty($Passphrase)) {
-                    Write-Log "Payload is encrypted but no -Passphrase supplied — skipping." "WARN"
+                    Write-SyncLog "Payload is encrypted but no -Passphrase supplied — skipping." "WARN"
                     $shared.LastRemoteStamp = $remote.UpdatedAt
                     continue
                 }
@@ -445,7 +451,7 @@ $inboundScript = {
                     $innerJson = Unprotect-Payload -EncJson $outer.payload
                 }
                 catch {
-                    Write-Log "Decryption failed — wrong passphrase? Error: $_" "ERROR"
+                    Write-SyncLog "Decryption failed — wrong passphrase? Error: $_" "ERROR"
                     $shared.LastRemoteStamp = $remote.UpdatedAt
                     continue
                 }
@@ -459,13 +465,13 @@ $inboundScript = {
             # Skip payloads that originated from this machine
             $incomingHash = Get-TextHash -Text $parsed.data
             if ($parsed.host -eq $env:COMPUTERNAME -or $incomingHash -eq $shared.LastPushedHash) {
-                Write-Log "Skipping — payload originated from this machine."
+                Write-SyncLog "Skipping — payload originated from this machine."
                 $shared.LastRemoteStamp = $remote.UpdatedAt
                 continue
             }
 
             # Apply to clipboard
-            Write-Log "━━ Data received from computer '$($parsed.host)' — synced at $(Get-Date -Format 'HH:mm:ss')" "OK"
+            Write-SyncLog "━━ Data received from computer '$($parsed.host)' — synced at $(Get-Date -Format 'HH:mm:ss')" "OK"
             Set-Clipboard -Value $parsed.data
 
             # Mark this hash as already in sync so the outbound loop doesn't
@@ -477,7 +483,7 @@ $inboundScript = {
             $shared.LastRemoteStamp = $remote.UpdatedAt
         }
         catch {
-            Write-Log "Inbound error: $_" "ERROR"
+            Write-SyncLog "Inbound error: $_" "ERROR"
         }
     }
 }
@@ -494,7 +500,7 @@ $rs.Open()
 $ps = [powershell]::Create()
 $ps.Runspace = $rs
 $null = $ps.AddScript($inboundScript).AddArgument($shared).AddArgument($GistId).AddArgument($Token).AddArgument($FileName).AddArgument($PollMin).AddArgument($PollMax).AddArgument($Passphrase)
-$asyncHandle = $ps.BeginInvoke()
+$null = $ps.BeginInvoke()   # the runspace runs until shutdown; nothing waits on the handle
 
 # =============================================================================
 #  OUTBOUND LOOP  (clipboard → Gist)  — main thread
@@ -515,7 +521,7 @@ function Invoke-DrainLogQueue {
     }
 }
 
-Write-Log "Outbound loop started — watching clipboard every 500 ms." "OK" "OUT"
+Write-SyncLog "Outbound loop started — watching clipboard every 500 ms." "OK" "OUT"
 $lastLocalHash = ""
 $inboundDead   = $false
 
@@ -526,9 +532,9 @@ try {
 
         if (-not $inboundDead -and $ps.InvocationStateInfo.State -in @('Failed', 'Stopped', 'Completed')) {
             $inboundDead = $true
-            Write-Log "Inbound loop thread stopped unexpectedly (state: $($ps.InvocationStateInfo.State)). Incoming sync from peers is no longer active; outbound push will keep running." "ERROR" "SYS"
+            Write-SyncLog "Inbound loop thread stopped unexpectedly (state: $($ps.InvocationStateInfo.State)). Incoming sync from peers is no longer active; outbound push will keep running." "ERROR" "SYS"
             if ($ps.Streams.Error.Count -gt 0) {
-                Write-Log "Last inbound error: $($ps.Streams.Error[-1])" "ERROR" "SYS"
+                Write-SyncLog "Last inbound error: $($ps.Streams.Error[-1])" "ERROR" "SYS"
             }
         }
 
@@ -552,12 +558,12 @@ try {
 
             # Credential scan before pushing
             if (Test-ContainsSecret -Text $text) {
-                Write-Log "BLOCKED: credential pattern detected — not syncing." "WARN" "OUT"
+                Write-SyncLog "BLOCKED: credential pattern detected — not syncing." "WARN" "OUT"
                 $lastLocalHash = $hash   # advance so warning isn't repeated every 500 ms
                 continue
             }
 
-            Write-Log "Local clipboard changed — pushing to Gist." "INFO" "OUT"
+            Write-SyncLog "Local clipboard changed — pushing to Gist." "INFO" "OUT"
 
             $inner = @{
                 data      = $text
@@ -571,21 +577,21 @@ try {
             } | ConvertTo-Json -Compress
 
             Push-Gist -JsonContent $gistContent
-            Write-Log "Pushed successfully." "OK" "OUT"
+            Write-SyncLog "Pushed successfully." "OK" "OUT"
 
             $shared.LastPushedHash = $hash
             $lastLocalHash         = $hash
         }
         catch {
-            Write-Log "Outbound error: $_" "ERROR" "OUT"
+            Write-SyncLog "Outbound error: $_" "ERROR" "OUT"
         }
     }
 }
 finally {
-    Write-Log "Shutting down..." "WARN" "SYS"
-    try { $ps.Stop()    } catch { }
-    try { $ps.Dispose() } catch { }
-    try { $rs.Close()   } catch { }
-    try { $rs.Dispose() } catch { }
-    Write-Log "ClipboardSync stopped." "WARN" "SYS"
+    Write-SyncLog "Shutting down..." "WARN" "SYS"
+    try { $ps.Stop()    } catch { Write-Verbose "Shutdown: $_" }
+    try { $ps.Dispose() } catch { Write-Verbose "Shutdown: $_" }
+    try { $rs.Close()   } catch { Write-Verbose "Shutdown: $_" }
+    try { $rs.Dispose() } catch { Write-Verbose "Shutdown: $_" }
+    Write-SyncLog "ClipboardSync stopped." "WARN" "SYS"
 }

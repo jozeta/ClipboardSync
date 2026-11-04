@@ -6,6 +6,10 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## Unreleased
 
+- PSScriptAnalyzer clean-up: `Write-Log` is now `Write-SyncLog` (it shadowed a built-in cmdlet),
+  shutdown errors are logged verbosely instead of swallowed, and the deliberate cases (plain-text
+  passphrase from an environment variable, parameters used by nested functions) are marked with why
+
 - First automated tests (Pester: secret scanner, AES-256 round trip, text hash) and CI on Windows
   that runs PSScriptAnalyzer and the tests
 

@@ -3,5 +3,6 @@
 @{
     Severity     = @('Error', 'Warning')
     # The console log is the user interface of this script.
-    ExcludeRules = @('PSAvoidUsingWriteHost')
+    # PSUseBOMForUnicodeEncodedFile: the script requires PowerShell 7, which reads UTF-8 without a BOM.
+    ExcludeRules = @('PSAvoidUsingWriteHost', 'PSUseBOMForUnicodeEncodedFile')
 }
