@@ -123,7 +123,7 @@ Using environment variables (recommended):
 | `-FileName` | `clipboard.json` | Filename used inside the Gist — must match on all machines |
 | `-PollMin` | `15` | Minimum poll interval in seconds |
 | `-PollMax` | `30` | Maximum poll interval in seconds |
-| `-Passphrase` | *(off)* | Shared passphrase for AES-256 encryption |
+| `-Passphrase` | *(off)* | Shared passphrase for AES-256-GCM encryption |
 
 ### Console output
 
@@ -154,11 +154,21 @@ Add `-Passphrase` to encrypt all payloads. Every machine must use the same passp
 
 | Property | Value |
 |---|---|
-| Algorithm | AES-256-CBC |
+| Algorithm | AES-256-GCM (authenticated encryption) |
 | Key derivation | PBKDF2-SHA256, 200,000 iterations |
 | Salt | 16 bytes, random per write |
-| IV | 16 bytes, random per write |
-| Padding | PKCS7 |
+| Nonce | 12 bytes, random per write |
+| Authentication tag | 128 bits; associated data `ClipboardSync/v2` |
+
+What this gives you:
+
+- **Confidentiality:** the Gist (and its revision history) holds only ciphertext. The text and the sending machine's name are both inside the encrypted part.
+- **Integrity:** a wrong passphrase, or any change to the salt, nonce, tag or ciphertext, fails the tag check. The payload is skipped with a `Decryption failed` error and never reaches the clipboard.
+- **No plaintext injection:** with `-Passphrase` set, a machine **refuses unencrypted payloads**. Someone who has only the Gist token can't push text onto your clipboard.
+
+The passphrase is the only secret that protects this: anyone who knows it can write payloads every machine will accept.
+
+> **Payload format v2.** Since the switch to AES-GCM the Gist file has a version field (`"v": 2`). Machines skip payloads in any other format with a `format v1, this machine reads v2` warning, and older versions of the script can't read v2. **Upgrade ClipboardSync on every machine at the same time.**
 
 > Never pass the passphrase as a literal string on the command line — store it in `$env:CLIPBOARD_PASSPHRASE` (see [Section 7](#7-storing-credentials-safely)).
 
@@ -248,7 +258,8 @@ $token = $cred.GetNetworkCredential().Password
 | Token rotation | Set an expiration. Revoke immediately at [github.com/settings/tokens](https://github.com/settings/tokens) if compromised. |
 | Rate limits | GitHub allows 5,000 authenticated requests/hour. Default poll settings use at most ~240 requests/hour — well within limits. |
 | Gist history | GitHub Gists keep **every revision forever**. Each push is a new revision, so even after content is overwritten by a later sync, the old (unencrypted, if `-Passphrase` isn't used) clipboard text is still readable by anyone with access to the Gist via its revision history. Use `-Passphrase` if the clipboard may ever contain anything sensitive. |
-| Encryption is confidentiality-only | AES-256-CBC has no integrity check (no HMAC/GCM). A tampered ciphertext isn't detected — it just fails to decrypt cleanly (or, rarely, decrypts to garbage without erroring). Don't rely on it to detect tampering, only to keep the plaintext private. |
+| Encryption is authenticated | AES-256-GCM: tampered or wrongly keyed payloads are detected and skipped, and with `-Passphrase` set unencrypted payloads are refused (see [Section 5](#5-encryption)). Without `-Passphrase`, anyone with the Gist token can put text on every machine's clipboard. |
+| Untrusted peer data | Text from the Gist is only ever placed on the clipboard, never run. The sender's host name is stripped of control characters before it is logged. |
 | Command-line exposure | `-Token` and `-Passphrase` are visible in plaintext to other processes on the same machine for the life of the process (e.g. Task Manager's "Command line" column, `Get-CimInstance Win32_Process`) — this is true even when the *value* comes from an environment variable at the call site, since PowerShell substitutes the literal value into the argument list before the process starts. A Scheduled Task that embeds these values in its **Arguments** field (see [Section 8](#8-running-automatically-at-login)) stores them in plaintext in the Task Scheduler configuration on disk. |
 
 ---
@@ -262,8 +273,10 @@ $token = $cred.GetNetworkCredential().Password
 | Script blocked / not signed | Run `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` in a `pwsh` window. |
 | `[IN ]` lines never appear | The inbound runspace may have crashed. Look for `[ERROR][SYS]` "Inbound loop thread stopped unexpectedly" — it reports the last inbound error and keeps outbound push running. |
 | Content blocked | Clipboard matched a credential pattern. Check the `[WARN]` log line for details. |
-| Decryption failed | Passphrase mismatch between machines. Ensure all machines use the same `-Passphrase` value. |
+| Decryption failed | Passphrase mismatch between machines, or the payload was altered. Ensure all machines use the same `-Passphrase` value. |
 | Payload encrypted, no passphrase | Run the script with `-Passphrase` matching the other machines. |
+| Refusing an unencrypted payload | Another machine runs without `-Passphrase`. Give every machine the same passphrase. |
+| Payload is in format v1 | Another machine runs an older version of the script. Update ClipboardSync on every machine. |
 | Script fails / syntax errors | Ensure you are using `pwsh.exe` (PowerShell 7), not `powershell.exe` (PS 5.1). |
 | Clipboard not updating on receive | Verify the `[IN ]` log shows the receive message. If it does, check that no other application is locking the clipboard. |
 
@@ -274,7 +287,8 @@ $token = $cred.GetNetworkCredential().Password
 - **Windows only.** The script relies on `System.Windows.Forms.Clipboard` and the `Set-Clipboard` cmdlet, both Windows-specific. It will not run on macOS or Linux, even under PowerShell 7.
 - **Clearing the clipboard doesn't sync.** If you cut/clear the clipboard so it's empty, or copy an image/rich text/HTML, nothing is pushed — peers simply keep showing their last-synced text. There's no way to propagate "clipboard is now empty" or "clipboard now holds non-text content."
 - **Last write wins, with no merge.** If two machines change their clipboard within the same poll window, whichever push reaches the Gist last simply overwrites the other — there is no conflict warning.
-- **Gist history is permanent** and **encryption has no integrity check** — see [Section 9](#9-security-considerations) for both.
+- **Gist history is permanent** — see [Section 9](#9-security-considerations).
+- **Upgrades must be done on all machines together** when the payload format changes (it did with the switch to AES-GCM) — see [Section 5](#5-encryption).
 - **Secret detection is a heuristic**, not a guarantee — see the caveat in [Section 6](#6-credential-detection).
 - **Secrets can leak via the process command line and Scheduled Task config**, independent of anything the script does — see the "Command-line exposure" row in [Section 9](#9-security-considerations). Where possible, prefer typing the token/passphrase into your `$PROFILE` as environment variables over pasting them into a Scheduled Task's Arguments field.
 

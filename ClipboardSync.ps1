@@ -34,7 +34,8 @@
     The actual interval is randomised between PollMin and PollMax each cycle.
 
 .PARAMETER Passphrase
-    Enables AES-256-CBC encryption. All machines must share the same passphrase.
+    Enables AES-256-GCM encryption. All machines must share the same passphrase.
+    With a passphrase set, unencrypted payloads from the Gist are refused.
     Best practice: store in $env:CLIPBOARD_PASSPHRASE.
 
 .EXAMPLE
@@ -105,113 +106,271 @@ function Test-ContainsSecret {
 }
 
 # =============================================================================
-#  AES-256-CBC ENCRYPTION
+#  JSON HELPER
+# =============================================================================
+
+# Reads one field of an object from ConvertFrom-Json / Invoke-RestMethod, or $null if the object
+# isn't one or has no such field. Under Set-StrictMode a missing property would throw instead.
+function Get-JsonField {
+    param($Object, [string]$Name)
+    if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($null -eq $p) { return $null }
+    return $p.Value
+}
+
+# =============================================================================
+#  AES-256-GCM ENCRYPTION
 # =============================================================================
 #
-#  Gist envelope (always JSON):
-#    { "encrypted": true|false, "payload": "<string>" }
+#  Gist file, payload format v2 (always JSON):
+#    { "v": 2, "encrypted": true|false, "payload": "<string>" }
 #
-#  When encrypted=true, payload is:
-#    { "salt": "<base64>", "iv": "<base64>", "cipher": "<base64>" }
+#  payload, unencrypted : { "data": "<base64 of the UTF-8 text>", "timestamp": "<ISO 8601>", "host": "<name>" }
+#  payload, encrypted   : { "salt": "<b64, 16 B>", "nonce": "<b64, 12 B>", "tag": "<b64, 16 B>", "cipher": "<b64>" }
+#                         where the ciphertext is the unencrypted payload above.
 #
-#  Key derivation : PBKDF2-SHA256, 200 000 iterations, 32-byte key.
-#  Fresh random salt + IV generated on every write.
+#  Key derivation : PBKDF2-SHA256, 200 000 iterations, 32-byte key, fresh random salt per write.
+#  Cipher         : AES-256-GCM, fresh random nonce per write, 128-bit tag, associated data
+#                   "ClipboardSync/v2". A wrong passphrase or any change to salt, nonce, tag or
+#                   ciphertext fails the tag check, so nothing tampered is ever applied.
+#  The text is base64 inside the payload so ConvertFrom-Json can't turn date-like text into a
+#  [datetime]. Format v1 (AES-CBC, no integrity check) is no longer read.
 
 function Invoke-DeriveKey {
     param([string]$Pass, [byte[]]$Salt)
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
+    $kdf = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
                [System.Text.Encoding]::UTF8.GetBytes($Pass),
                $Salt, 200000,
                [System.Security.Cryptography.HashAlgorithmName]::SHA256)
-    return $kdf.GetBytes(32)
+    try     { return , $kdf.GetBytes(32) }
+    finally { $kdf.Dispose() }
+}
+
+function Get-AesGcm {
+    param([byte[]]$Key)
+    # .NET 8+ (PowerShell 7.4+) wants the tag size stated; older .NET only has the key-only constructor.
+    if ([System.Security.Cryptography.AesGcm].GetConstructor([type[]]@([byte[]], [int]))) {
+        return [System.Security.Cryptography.AesGcm]::new($Key, 16)
+    }
+    return [System.Security.Cryptography.AesGcm]::new($Key)
 }
 
 function Protect-Payload {
-    param([string]$Plaintext)
-    if ([string]::IsNullOrEmpty($Passphrase)) { return $Plaintext }
+    param([string]$Plaintext, [string]$Pass)
+    $salt  = [byte[]]::new(16)
+    $nonce = [byte[]]::new(12)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($salt)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($nonce)
 
-    $aes = [System.Security.Cryptography.Aes]::Create()
+    $plain  = [System.Text.Encoding]::UTF8.GetBytes($Plaintext)
+    $cipher = [byte[]]::new($plain.Length)
+    $tag    = [byte[]]::new(16)
+    $aad    = [System.Text.Encoding]::UTF8.GetBytes('ClipboardSync/v2')
+
+    [byte[]]$key = Invoke-DeriveKey -Pass $Pass -Salt $salt
     try {
-        $aes.KeySize   = 256
-        $aes.BlockSize = 128
-        $aes.Mode      = [System.Security.Cryptography.CipherMode]::CBC
-        $aes.Padding   = [System.Security.Cryptography.PaddingMode]::PKCS7
-
-        $salt = [byte[]]::new(16)
-        $iv   = [byte[]]::new(16)
-        [System.Security.Cryptography.RandomNumberGenerator]::Fill($salt)
-        [System.Security.Cryptography.RandomNumberGenerator]::Fill($iv)
-
-        $aes.Key = Invoke-DeriveKey -Pass $Passphrase -Salt $salt
-        $aes.IV  = $iv
-
-        $enc = $aes.CreateEncryptor()
-        try {
-            $plain  = [System.Text.Encoding]::UTF8.GetBytes($Plaintext)
-            $cipher = $enc.TransformFinalBlock($plain, 0, $plain.Length)
-        }
-        finally { $enc.Dispose() }
-
-        return @{
-            salt   = [Convert]::ToBase64String($salt)
-            iv     = [Convert]::ToBase64String($iv)
-            cipher = [Convert]::ToBase64String($cipher)
-        } | ConvertTo-Json -Compress
+        $gcm = Get-AesGcm -Key $key
+        try     { $gcm.Encrypt($nonce, $plain, $cipher, $tag, $aad) }
+        finally { $gcm.Dispose() }
     }
-    finally { $aes.Dispose() }
+    finally { [Array]::Clear($key, 0, $key.Length) }
+
+    return [ordered]@{
+        salt   = [Convert]::ToBase64String($salt)
+        nonce  = [Convert]::ToBase64String($nonce)
+        tag    = [Convert]::ToBase64String($tag)
+        cipher = [Convert]::ToBase64String($cipher)
+    } | ConvertTo-Json -Compress
 }
 
+# Throws if the JSON is malformed, the passphrase is wrong, or anything was altered.
 function Unprotect-Payload {
-    param([string]$EncJson)
-    if ([string]::IsNullOrEmpty($Passphrase)) { return $EncJson }
-
-    try   { $e = $EncJson | ConvertFrom-Json }
-    catch { return $EncJson }
-
-    $aes = [System.Security.Cryptography.Aes]::Create()
-    try {
-        $aes.KeySize   = 256
-        $aes.BlockSize = 128
-        $aes.Mode      = [System.Security.Cryptography.CipherMode]::CBC
-        $aes.Padding   = [System.Security.Cryptography.PaddingMode]::PKCS7
-        $aes.Key       = Invoke-DeriveKey -Pass $Passphrase -Salt ([Convert]::FromBase64String($e.salt))
-        $aes.IV        = [Convert]::FromBase64String($e.iv)
-
-        $dec = $aes.CreateDecryptor()
-        try {
-            $cipher = [Convert]::FromBase64String($e.cipher)
-            $plain  = $dec.TransformFinalBlock($cipher, 0, $cipher.Length)
-        }
-        finally { $dec.Dispose() }
-
-        return [System.Text.Encoding]::UTF8.GetString($plain)
+    param([string]$EncJson, [string]$Pass)
+    $e      = $EncJson | ConvertFrom-Json
+    $salt   = [Convert]::FromBase64String([string](Get-JsonField $e 'salt'))
+    $nonce  = [Convert]::FromBase64String([string](Get-JsonField $e 'nonce'))
+    $tag    = [Convert]::FromBase64String([string](Get-JsonField $e 'tag'))
+    $cipher = [Convert]::FromBase64String([string](Get-JsonField $e 'cipher'))
+    if ($salt.Length -ne 16 -or $nonce.Length -ne 12 -or $tag.Length -ne 16) {
+        throw "Malformed encrypted payload (salt, nonce or tag has the wrong length)."
     }
-    finally { $aes.Dispose() }
+    $plain = [byte[]]::new($cipher.Length)
+    $aad   = [System.Text.Encoding]::UTF8.GetBytes('ClipboardSync/v2')
+
+    [byte[]]$key = Invoke-DeriveKey -Pass $Pass -Salt $salt
+    try {
+        $gcm = Get-AesGcm -Key $key
+        try     { $gcm.Decrypt($nonce, $cipher, $tag, $plain, $aad) }
+        finally { $gcm.Dispose() }
+    }
+    finally { [Array]::Clear($key, 0, $key.Length) }
+
+    return [System.Text.Encoding]::UTF8.GetString($plain)
+}
+
+# =============================================================================
+#  PAYLOAD FORMAT v2  (pure: no I/O)
+# =============================================================================
+
+# Builds the Gist file content for one clipboard text. Encrypted whenever a passphrase is given.
+function ConvertTo-GistContent {
+    param([string]$Text, [string]$HostName, [string]$Pass, [string]$Timestamp = (Get-Date -Format 'o'))
+    $inner = [ordered]@{
+        data      = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
+        timestamp = $Timestamp
+        host      = $HostName
+    } | ConvertTo-Json -Compress
+
+    $encrypted = -not [string]::IsNullOrEmpty($Pass)
+    $payload   = if ($encrypted) { Protect-Payload -Plaintext $inner -Pass $Pass } else { $inner }
+
+    return [ordered]@{ v = 2; encrypted = $encrypted; payload = $payload } | ConvertTo-Json -Compress
+}
+
+# Reads a Gist file written by ConvertTo-GistContent. Never throws. Returns
+#   @{ Ok = $true;  Text; Host }               when the payload can be applied, or
+#   @{ Ok = $false; Level; Message }           when it must be skipped, and why.
+# With a passphrase set, only authenticated encrypted payloads are accepted.
+function ConvertFrom-GistContent {
+    param([string]$Content, [string]$Pass)
+    $skip = { param($Level, $Message) @{ Ok = $false; Level = $Level; Message = $Message } }
+
+    try   { $outer = $Content | ConvertFrom-Json }
+    catch { return (& $skip 'ERROR' 'The Gist file is not valid JSON - skipping.') }
+
+    $version = Get-JsonField $outer 'v'
+    if ($null -eq $version -or "$version" -ne '2') {
+        $seen = if ($null -eq $version) { 'v1' } else { "v$version" }
+        return (& $skip 'WARN' "Payload is in format $seen, this machine reads v2 - skipping. Run the same ClipboardSync version on every machine.")
+    }
+
+    $payload = Get-JsonField $outer 'payload'
+    if ($payload -isnot [string]) { return (& $skip 'ERROR' 'Payload is malformed (no payload text) - skipping.') }
+
+    $isEncrypted = (Get-JsonField $outer 'encrypted') -eq $true
+    $hasPass     = -not [string]::IsNullOrEmpty($Pass)
+
+    if ($isEncrypted -and -not $hasPass) {
+        return (& $skip 'WARN' 'Payload is encrypted but no -Passphrase supplied - skipping.')
+    }
+    if (-not $isEncrypted -and $hasPass) {
+        return (& $skip 'WARN' 'Refusing an unencrypted payload: encryption is on here, so every machine must use the same -Passphrase.')
+    }
+
+    if ($isEncrypted) {
+        try   { $innerJson = Unprotect-Payload -EncJson $payload -Pass $Pass }
+        catch { return (& $skip 'ERROR' "Decryption failed - wrong passphrase, or the payload was altered. Skipping. ($($_.Exception.Message))") }
+    }
+    else {
+        $innerJson = $payload
+    }
+
+    try {
+        $inner = $innerJson | ConvertFrom-Json
+        $data  = Get-JsonField $inner 'data'
+        $from  = Get-JsonField $inner 'host'
+        if ($data -isnot [string] -or $from -isnot [string]) { throw 'missing data or host' }
+        $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($data))
+    }
+    catch { return (& $skip 'ERROR' 'Payload is malformed - skipping.') }
+
+    if ($text.Length -eq 0) { return (& $skip 'WARN' 'Payload has no text - skipping.') }
+    return @{ Ok = $true; Text = $text; Host = $from }
+}
+
+function Get-TextHash {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return "empty" }
+    $bytes  = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try   { return [Convert]::ToBase64String($sha256.ComputeHash($bytes)) }
+    finally { $sha256.Dispose() }
+}
+
+# =============================================================================
+#  SYNC DECISIONS  (pure: no I/O; the loops below act on the result)
+# =============================================================================
+
+# Outbound: what to do with the text currently on the local clipboard. Returns @{ Action; Hash }:
+#   none     nothing text-like, or unchanged since the last check
+#   synced   this text is what was last pushed or received: remember it, don't push
+#   blocked  matches a credential pattern: remember it (so the warning shows once), don't push
+#   push     new local text: push it
+function Get-OutboundAction {
+    param([string]$Text, [string]$LastLocalHash, [string]$LastPushedHash)
+    if ([string]::IsNullOrEmpty($Text)) { return @{ Action = 'none'; Hash = $null } }
+    $hash = Get-TextHash -Text $Text
+    if ($hash -eq $LastLocalHash)        { return @{ Action = 'none';    Hash = $hash } }
+    if ($hash -eq $LastPushedHash)       { return @{ Action = 'synced';  Hash = $hash } }
+    if (Test-ContainsSecret -Text $Text) { return @{ Action = 'blocked'; Hash = $hash } }
+    return @{ Action = 'push'; Hash = $hash }
+}
+
+# Inbound: what to do with what was fetched from the Gist ($Remote = @{ Content; UpdatedAt } or $null).
+# Returns @{ Action; Level; Message; MarkSeen; Text; Hash }:
+#   Action    none   empty Gist, or nothing new since the last poll
+#             skip   a new version this machine won't apply (its own echo, refused, unreadable)
+#             apply  put Text on the clipboard
+#   MarkSeen  remember this Gist version (UpdatedAt) so it isn't looked at again
+function Resolve-InboundUpdate {
+    param($Remote, [string]$LastRemoteStamp, [string]$LastPushedHash, [string]$LocalHost, [string]$Pass)
+    $result = { param($Action, $Level, $Message, $MarkSeen)
+        @{ Action = $Action; Level = $Level; Message = $Message; MarkSeen = $MarkSeen; Text = $null; Hash = $null } }
+
+    if ($null -eq $Remote -or [string]::IsNullOrWhiteSpace($Remote.Content) -or $Remote.Content.Trim() -eq '{}') {
+        return (& $result 'none' 'INFO' $null $false)
+    }
+    if ([string]($Remote.UpdatedAt) -eq $LastRemoteStamp) {
+        return (& $result 'none' 'INFO' 'No new data from peers.' $false)
+    }
+
+    $read = ConvertFrom-GistContent -Content $Remote.Content -Pass $Pass
+    if (-not $read.Ok) { return (& $result 'skip' $read.Level $read.Message $true) }
+
+    $hash = Get-TextHash -Text $read.Text
+    if ($read.Host -eq $LocalHost -or $hash -eq $LastPushedHash) {
+        return (& $result 'skip' 'INFO' 'Skipping - payload originated from this machine or is already in sync.' $true)
+    }
+
+    # The host name comes from the Gist: strip control characters (terminal escapes) before logging it.
+    $shownHost = $read.Host -replace '\p{C}', '?'
+    if ($shownHost.Length -gt 64) { $shownHost = $shownHost.Substring(0, 64) + '...' }
+
+    $r = & $result 'apply' 'OK' "━━ Data received from computer '$shownHost' — synced at $(Get-Date -Format 'HH:mm:ss')" $true
+    $r.Text = $read.Text
+    $r.Hash = $hash
+    return $r
 }
 
 # =============================================================================
 #  GITHUB GIST REST API
 # =============================================================================
 
-$script:GistUri = "https://api.github.com/gists/$GistId"
-$script:Headers = @{
-    "Authorization"        = "Bearer $Token"
-    "Accept"               = "application/vnd.github+json"
-    "X-GitHub-Api-Version" = "2022-11-28"
-    "User-Agent"           = "ClipboardSync-PowerShell/3.0"
+function Get-GistRequestHeader {
+    param([string]$Token)
+    return @{
+        "Authorization"        = "Bearer $Token"
+        "Accept"               = "application/vnd.github+json"
+        "X-GitHub-Api-Version" = "2022-11-28"
+        "User-Agent"           = "ClipboardSync-PowerShell/4.0"
+    }
+}
+
+# Returns @{ Content; UpdatedAt } for the sync file, or $null if the Gist has no such file.
+function Get-Gist {
+    param([string]$GistId, [hashtable]$Headers, [string]$FileName)
+    $r    = Invoke-RestMethod -Uri "https://api.github.com/gists/$GistId" -Method Get -Headers $Headers
+    $file = Get-JsonField (Get-JsonField $r 'files') $FileName
+    if ($null -eq $file) { return $null }
+    return @{ Content = [string](Get-JsonField $file 'content'); UpdatedAt = [string](Get-JsonField $r 'updated_at') }
 }
 
 function Push-Gist {
-    param([string]$JsonContent)
+    param([string]$GistId, [hashtable]$Headers, [string]$FileName, [string]$JsonContent)
     $body = @{ files = @{ $FileName = @{ content = $JsonContent } } } | ConvertTo-Json -Depth 5
-    Invoke-RestMethod -Uri $script:GistUri -Method Patch `
-        -Headers $script:Headers -Body $body -ContentType "application/json" | Out-Null
-}
-
-function Get-Gist {
-    $r = Invoke-RestMethod -Uri $script:GistUri -Method Get -Headers $script:Headers
-    if (-not $r.files.$FileName) { return $null }
-    return @{ Content = $r.files.$FileName.content; UpdatedAt = $r.updated_at }
+    Invoke-RestMethod -Uri "https://api.github.com/gists/$GistId" -Method Patch `
+        -Headers $Headers -Body $body -ContentType "application/json" | Out-Null
 }
 
 # =============================================================================
@@ -241,15 +400,6 @@ function Get-ClipboardText {
     }
 
     return $null
-}
-
-function Get-TextHash {
-    param([string]$Text)
-    if ([string]::IsNullOrEmpty($Text)) { return "empty" }
-    $bytes  = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try   { return [Convert]::ToBase64String($sha256.ComputeHash($bytes)) }
-    finally { $sha256.Dispose() }
 }
 
 # =============================================================================
@@ -302,12 +452,14 @@ if ($PollMin -le 0 -or $PollMax -lt $PollMin) {
 }
 
 if ($Passphrase) {
-    Write-SyncLog "Encryption: AES-256-CBC, PBKDF2-SHA256 (200 000 iterations)." "INFO" "SYS"
+    Write-SyncLog "Encryption: AES-256-GCM, PBKDF2-SHA256 (200 000 iterations). Unencrypted payloads are refused." "INFO" "SYS"
 }
+
+$headers = Get-GistRequestHeader -Token $Token
 
 Write-SyncLog "Verifying Gist access..." "INFO" "SYS"
 try {
-    $probe = Get-Gist
+    $probe = Get-Gist -GistId $GistId -Headers $headers -FileName $FileName
     $shared.LastRemoteStamp = if ($probe) { $probe.UpdatedAt } else { "" }
     Write-SyncLog "Gist access confirmed. Host: $($env:COMPUTERNAME)" "OK" "SYS"
 }
@@ -324,22 +476,23 @@ Write-SyncLog ("Host: {0}  |  Gist: {1}  |  Poll: {2}-{3}s  |  Enc: {4}" -f
 # =============================================================================
 #  INBOUND SCRIPT BLOCK  (Gist → clipboard)
 #
-#  Runs inside a dedicated PowerShell runspace. All functions it needs are
-#  defined inline — runspaces start with a blank session state.
-#  All communication with the outbound loop is via $shared.
+#  Runs inside a dedicated PowerShell runspace. Runspaces start with a blank
+#  session state, so the functions it needs are copied in from this script
+#  (see LAUNCH INBOUND RUNSPACE). All communication with the outbound loop is
+#  via $shared.
 # =============================================================================
 
 $inboundScript = {
-    # GistId, Token and FileName are read by the nested Gist functions below (dynamic scope).
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Passphrase', Justification = 'Comes from an environment variable; see the main param block')]
     param(
         [hashtable]$shared,
         [string]$GistId,
-        [string]$Token,
+        [hashtable]$Headers,
         [string]$FileName,
         [int]$PollMin,
         [int]$PollMax,
-        [string]$Passphrase
+        [string]$Passphrase,
+        [string]$LocalHost
     )
 
     # ── logging (via queue — Write-Host doesn't reach parent console) ─────────
@@ -350,64 +503,6 @@ $inboundScript = {
             Level   = $Level
             Message = $Message
         })
-    }
-
-    # ── crypto ────────────────────────────────────────────────────────────────
-    function Invoke-DeriveKey {
-        param([string]$Pass, [byte[]]$Salt)
-        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
-                   [System.Text.Encoding]::UTF8.GetBytes($Pass),
-                   $Salt, 200000,
-                   [System.Security.Cryptography.HashAlgorithmName]::SHA256)
-        return $kdf.GetBytes(32)
-    }
-
-    function Unprotect-Payload {
-        param([string]$EncJson)
-        if ([string]::IsNullOrEmpty($Passphrase)) { return $EncJson }
-        try   { $e = $EncJson | ConvertFrom-Json }
-        catch { return $EncJson }
-        $aes = [System.Security.Cryptography.Aes]::Create()
-        try {
-            $aes.KeySize   = 256
-            $aes.BlockSize = 128
-            $aes.Mode      = [System.Security.Cryptography.CipherMode]::CBC
-            $aes.Padding   = [System.Security.Cryptography.PaddingMode]::PKCS7
-            $aes.Key       = Invoke-DeriveKey -Pass $Passphrase -Salt ([Convert]::FromBase64String($e.salt))
-            $aes.IV        = [Convert]::FromBase64String($e.iv)
-            $dec = $aes.CreateDecryptor()
-            try {
-                $cipher = [Convert]::FromBase64String($e.cipher)
-                $plain  = $dec.TransformFinalBlock($cipher, 0, $cipher.Length)
-            }
-            finally { $dec.Dispose() }
-            return [System.Text.Encoding]::UTF8.GetString($plain)
-        }
-        finally { $aes.Dispose() }
-    }
-
-    # ── hash ──────────────────────────────────────────────────────────────────
-    function Get-TextHash {
-        param([string]$Text)
-        if ([string]::IsNullOrEmpty($Text)) { return "empty" }
-        $bytes  = [System.Text.Encoding]::UTF8.GetBytes($Text)
-        $sha256 = [System.Security.Cryptography.SHA256]::Create()
-        try   { return [Convert]::ToBase64String($sha256.ComputeHash($bytes)) }
-        finally { $sha256.Dispose() }
-    }
-
-    # ── Gist fetch ────────────────────────────────────────────────────────────
-    function Get-GistRemote {
-        $headers = @{
-            "Authorization"        = "Bearer $Token"
-            "Accept"               = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-            "User-Agent"           = "ClipboardSync-PowerShell/3.0"
-        }
-        $r = Invoke-RestMethod -Uri "https://api.github.com/gists/$GistId" `
-                -Method Get -Headers $headers
-        if (-not $r.files.$FileName) { return $null }
-        return @{ Content = $r.files.$FileName.content; UpdatedAt = $r.updated_at }
     }
 
     # ── inbound loop ──────────────────────────────────────────────────────────
@@ -427,59 +522,24 @@ $inboundScript = {
                 Start-Sleep -Seconds $delay
             }
 
-            $remote = Get-GistRemote
+            $remote = Get-Gist -GistId $GistId -Headers $Headers -FileName $FileName
+            $update = Resolve-InboundUpdate -Remote $remote -LastRemoteStamp $shared.LastRemoteStamp `
+                          -LastPushedHash $shared.LastPushedHash -LocalHost $LocalHost -Pass $Passphrase
 
-            if ($null -eq $remote -or $remote.Content -eq "{}") { continue }
+            if ($update.Message) { Write-SyncLog $update.Message $update.Level }
 
-            if ($remote.UpdatedAt -eq $shared.LastRemoteStamp) {
-                Write-SyncLog "No new data from peers."
-                continue
+            if ($update.Action -eq 'apply') {
+                Set-Clipboard -Value $update.Text
+
+                # Mark this hash as already in sync so the outbound loop doesn't
+                # see the clipboard change and immediately re-push it as its own.
+                $shared.LastPushedHash = $update.Hash
+
+                # Tell outbound loop to pause briefly so it doesn't echo this back
+                $shared.IgnoreUntil = [datetime]::UtcNow.AddSeconds(5)
             }
 
-            # Parse outer envelope
-            $outer = $remote.Content | ConvertFrom-Json
-
-            # Decrypt inner payload if needed
-            if ($outer.encrypted) {
-                if ([string]::IsNullOrEmpty($Passphrase)) {
-                    Write-SyncLog "Payload is encrypted but no -Passphrase supplied — skipping." "WARN"
-                    $shared.LastRemoteStamp = $remote.UpdatedAt
-                    continue
-                }
-                try {
-                    $innerJson = Unprotect-Payload -EncJson $outer.payload
-                }
-                catch {
-                    Write-SyncLog "Decryption failed — wrong passphrase? Error: $_" "ERROR"
-                    $shared.LastRemoteStamp = $remote.UpdatedAt
-                    continue
-                }
-            }
-            else {
-                $innerJson = $outer.payload
-            }
-
-            $parsed = $innerJson | ConvertFrom-Json
-
-            # Skip payloads that originated from this machine
-            $incomingHash = Get-TextHash -Text $parsed.data
-            if ($parsed.host -eq $env:COMPUTERNAME -or $incomingHash -eq $shared.LastPushedHash) {
-                Write-SyncLog "Skipping — payload originated from this machine."
-                $shared.LastRemoteStamp = $remote.UpdatedAt
-                continue
-            }
-
-            # Apply to clipboard
-            Write-SyncLog "━━ Data received from computer '$($parsed.host)' — synced at $(Get-Date -Format 'HH:mm:ss')" "OK"
-            Set-Clipboard -Value $parsed.data
-
-            # Mark this hash as already in sync so the outbound loop doesn't
-            # see the clipboard change and immediately re-push it as its own.
-            $shared.LastPushedHash = $incomingHash
-
-            # Tell outbound loop to pause briefly so it doesn't echo this back
-            $shared.IgnoreUntil     = [datetime]::UtcNow.AddSeconds(5)
-            $shared.LastRemoteStamp = $remote.UpdatedAt
+            if ($update.MarkSeen) { $shared.LastRemoteStamp = $remote.UpdatedAt }
         }
         catch {
             Write-SyncLog "Inbound error: $_" "ERROR"
@@ -491,14 +551,22 @@ $inboundScript = {
 #  LAUNCH INBOUND RUNSPACE
 # =============================================================================
 
-$rs = [runspacefactory]::CreateRunspace()
+# Copy the functions the inbound loop uses into the runspace, so there is one definition of each.
+$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+foreach ($name in 'Get-JsonField', 'Invoke-DeriveKey', 'Get-AesGcm', 'Unprotect-Payload',
+                  'ConvertFrom-GistContent', 'Get-TextHash', 'Resolve-InboundUpdate', 'Get-Gist') {
+    $definition = (Get-Command -Name $name -CommandType Function).Definition
+    $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $definition))
+}
+
+$rs = [runspacefactory]::CreateRunspace($iss)
 $rs.ApartmentState = [System.Threading.ApartmentState]::STA
 $rs.ThreadOptions  = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
 $rs.Open()
 
 $ps = [powershell]::Create()
 $ps.Runspace = $rs
-$null = $ps.AddScript($inboundScript).AddArgument($shared).AddArgument($GistId).AddArgument($Token).AddArgument($FileName).AddArgument($PollMin).AddArgument($PollMax).AddArgument($Passphrase)
+$null = $ps.AddScript($inboundScript).AddArgument($shared).AddArgument($GistId).AddArgument($headers).AddArgument($FileName).AddArgument($PollMin).AddArgument($PollMax).AddArgument($Passphrase).AddArgument($env:COMPUTERNAME)
 $null = $ps.BeginInvoke()   # the runspace runs until shutdown; nothing waits on the handle
 
 # =============================================================================
@@ -542,44 +610,29 @@ try {
             if ([datetime]::UtcNow -lt $shared.IgnoreUntil) { continue }
 
             $text = Get-ClipboardText
+            $out  = Get-OutboundAction -Text $text -LastLocalHash $lastLocalHash -LastPushedHash $shared.LastPushedHash
 
-            # Nothing text-like on clipboard (image, rich text, or empty)
-            if ($null -eq $text) { continue }
+            if ($out.Action -eq 'none') { continue }
 
-            $hash = Get-TextHash -Text $text
-            if ($hash -eq $lastLocalHash) { continue }
-
-            # Content just arrived from a peer (or is what we last pushed) — already in sync, don't re-push it.
-            if ($hash -eq $shared.LastPushedHash) {
-                $lastLocalHash = $hash
+            if ($out.Action -eq 'synced') {
+                $lastLocalHash = $out.Hash
                 continue
             }
 
-            # Credential scan before pushing
-            if (Test-ContainsSecret -Text $text) {
+            if ($out.Action -eq 'blocked') {
                 Write-SyncLog "BLOCKED: credential pattern detected — not syncing." "WARN" "OUT"
-                $lastLocalHash = $hash   # advance so warning isn't repeated every 500 ms
+                $lastLocalHash = $out.Hash   # advance so warning isn't repeated every 500 ms
                 continue
             }
 
             Write-SyncLog "Local clipboard changed — pushing to Gist." "INFO" "OUT"
-
-            $inner = @{
-                data      = $text
-                timestamp = (Get-Date -Format "o")
-                host      = $env:COMPUTERNAME
-            } | ConvertTo-Json -Compress
-
-            $gistContent = @{
-                encrypted = ($Passphrase -ne "")
-                payload   = (Protect-Payload -Plaintext $inner)
-            } | ConvertTo-Json -Compress
-
-            Push-Gist -JsonContent $gistContent
+            $content = ConvertTo-GistContent -Text $text -HostName $env:COMPUTERNAME -Pass $Passphrase
+            Push-Gist -GistId $GistId -Headers $headers -FileName $FileName -JsonContent $content
             Write-SyncLog "Pushed successfully." "OK" "OUT"
 
-            $shared.LastPushedHash = $hash
-            $lastLocalHash         = $hash
+            # Only after a successful push, so a failed one is retried on the next check.
+            $shared.LastPushedHash = $out.Hash
+            $lastLocalHash         = $out.Hash
         }
         catch {
             Write-SyncLog "Outbound error: $_" "ERROR" "OUT"

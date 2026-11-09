@@ -17,8 +17,9 @@ scanner. The README is the full user guide.
 
 Parameters: `-GistId` and `-Token` (PAT with `gist` scope only) are required; `-FileName`
 (default `clipboard.json`, must match on all machines), `-PollMin`/`-PollMax` (15/30 s),
-`-Passphrase`. Windows-only (uses the Windows clipboard). `Invoke-Pester -Path tests` covers the secret scanner and the
-encryption (functions loaded from the syntax tree; the sync loop never runs); test syncing itself with two
+`-Passphrase`. Windows-only (uses the Windows clipboard). `Invoke-Pester -Path tests` covers the secret scanner,
+the encryption and payload format, and the push/pull decisions (functions loaded from the syntax tree and run
+under StrictMode; the sync loops never run). Clipboard and Gist I/O aren't tested: test syncing itself with two
 machines or two sessions pointed at a throwaway secret Gist.
 
 ## How it works
@@ -30,8 +31,15 @@ machines or two sessions pointed at a throwaway secret Gist.
   other machines' changes. **Last write wins.**
 - **Echo prevention:** each payload carries hostname + content hash, so a machine ignores its own
   pushes.
-- **Encryption:** AES-256-CBC, PBKDF2-SHA256 (200,000 iterations), random 16-byte salt and IV per
-  write, PKCS7. Confidentiality only: there is no MAC, so tampering isn't detected.
+- **Payload format v2:** `{"v":2,"encrypted":bool,"payload":...}`; the text is base64 inside the payload.
+  Other versions are skipped with a warning (v1, AES-CBC without integrity, is no longer read).
+- **Encryption:** AES-256-GCM, PBKDF2-SHA256 (200,000 iterations), random 16-byte salt and 12-byte
+  nonce per write, associated data `ClipboardSync/v2`. With `-Passphrase` set, unencrypted payloads
+  are refused.
+- **Structure:** the loops only do I/O; the decisions are pure functions (`Get-OutboundAction`,
+  `Resolve-InboundUpdate`, `ConvertTo-/ConvertFrom-GistContent`). The inbound runspace gets copies
+  of the functions it needs through an `InitialSessionState`, so each is defined once. The script
+  runs under `Set-StrictMode -Version Latest`: read JSON fields with `Get-JsonField`.
 - Only plain text and file paths are synced; images, rich text and HTML are skipped.
 
 ## Things to keep true when changing it
@@ -41,7 +49,8 @@ machines or two sessions pointed at a throwaway secret Gist.
 - Keep request volume well under GitHub's 5,000/hour limit (defaults use about 240/hour).
 - Gists keep every revision forever. Anything that weakens the secret scanner or makes encryption
   easier to skip is a security regression; update README §5–§9 if behaviour changes.
-- Keep the payload format backward compatible, or all machines must be upgraded together.
+- Keep the payload format backward compatible, or bump `v` and say in the README that all machines
+  must be upgraded together (as v2 did).
 
 ## App standards
 
